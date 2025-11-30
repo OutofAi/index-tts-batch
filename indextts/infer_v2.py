@@ -1010,6 +1010,29 @@ class IndexTTS2:
 
         code_lens_all = torch.tensor(code_lens_list, device=self.device, dtype=torch.long)
 
+        # ------------ NEW: batched second GPT forward -------------
+        m_start_time = time.perf_counter()
+        use_speed_batch = torch.zeros(B, device=self.device, dtype=torch.long)
+        
+        with torch.amp.autocast(text_tokens_padded.device.type,
+                                 enabled=self.dtype is not None,
+                                 dtype=self.dtype):
+            latent_batch = self.gpt(
+                speech_conditioning_latent_batch,          # [B, T_latent, C]
+                text_tokens_padded,                        # [B, T_text_max]
+                text_lengths,                              # [B]
+                codes_batch,                               # [B, T_code_max]
+                code_lens_all,                             # [B]
+                emo_cond_b,                                # [B, T_emo_max, C]
+                cond_mel_lengths=cond_lengths,            # [B]
+                emo_cond_mel_lengths=emo_cond_lengths,    # [B]
+                emo_vec=emovec,                            # [B, ...]
+                use_speed=use_speed_batch,                 # [B]
+            )
+        
+        gpt_forward_time += time.perf_counter() - m_start_time
+        # ----------------------------------------------------------
+
         # --- map total desired duration (ms) -> per-segment target_lengths (frames) ---
         per_seg_target_lengths = None
         if target_length_ms is not None and target_length_ms > 0:
@@ -1027,21 +1050,22 @@ class IndexTTS2:
                 per_seg_frames = (base_frames * ratio).clamp(min=1.0).long()
                 per_seg_target_lengths = per_seg_frames  # [B]
 
+
         for seg_idx in range(segments_count):
             self._set_gr_progress(
                 0.2 + 0.7 * seg_idx / segments_count,
                 f"speech synthesis {seg_idx + 1}/{segments_count}..."
             )
-
-            text_tokens = text_tokens_padded[seg_idx:seg_idx + 1]                # [1, T_text]
-            codes = codes_batch[seg_idx:seg_idx + 1]                             # [1, T_code]
-            speech_conditioning_latent = speech_conditioning_latent_batch[seg_idx:seg_idx + 1]
-
+        
+            # still get the tokens / codes for convenience
+            text_tokens = text_tokens_padded[seg_idx:seg_idx + 1]       # [1, T_text]
+            codes = codes_batch[seg_idx:seg_idx + 1]                    # [1, T_code]
+        
             # use precomputed code length for this segment
             code_len = int(code_lens_all[seg_idx].item())
             codes = codes[:, :code_len]
             code_lens = torch.tensor([code_len], device=self.device, dtype=torch.long)
-
+        
             if (codes[:, -1] != self.stop_mel_token).any() and not has_warned:
                 warnings.warn(
                     f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
@@ -1049,26 +1073,10 @@ class IndexTTS2:
                     category=RuntimeWarning
                 )
                 has_warned = True
-
-            # -------- second GPT forward (non-autoregressive) ----------
-            m_start_time = time.perf_counter()
-            use_speed = torch.zeros(1, device=self.device, dtype=torch.long)
-            with torch.amp.autocast(text_tokens.device.type,
-                                    enabled=self.dtype is not None,
-                                    dtype=self.dtype):
-                latent = self.gpt(
-                    speech_conditioning_latent,
-                    text_tokens,
-                    torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
-                    codes,
-                    torch.tensor([codes.shape[-1]], device=text_tokens.device),
-                    emo_cond_b[seg_idx:seg_idx + 1],
-                    cond_mel_lengths=torch.tensor([spk_cond_b.shape[1]], device=text_tokens.device),
-                    emo_cond_mel_lengths=torch.tensor([emo_cond_b.shape[1]], device=text_tokens.device),
-                    emo_vec=emovec[seg_idx:seg_idx + 1],
-                    use_speed=use_speed,
-                )
-            gpt_forward_time += time.perf_counter() - m_start_time
+        
+            # -------- NEW: just pick the precomputed latent -----------
+            latent = latent_batch[seg_idx:seg_idx + 1]   # [1, T_latent, C]
+            # -----------------------------------------------------------
 
             # -------------------- s2mel + BigVGAN ----------------------
             dtype = None
