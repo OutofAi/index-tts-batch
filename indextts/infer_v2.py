@@ -628,7 +628,30 @@ class IndexTTS2:
                 code_len = stop_idx[0].item()
             code_lens_list.append(code_len)
         code_lens_all = torch.tensor(code_lens_list, device=self.device, dtype=torch.long)
-    
+
+        # ------------ NEW: batched second GPT forward -------------
+        m_start_time = time.perf_counter()
+        use_speed_batch = torch.zeros(B, device=self.device, dtype=torch.long)
+        
+        with torch.amp.autocast(text_tokens_padded.device.type,
+                                 enabled=self.dtype is not None,
+                                 dtype=self.dtype):
+            latent_batch = self.gpt(
+                speech_conditioning_latent_batch,     # [B, T_latent, C]
+                text_tokens_padded,                   # [B, T_text_max]
+                text_lengths,                         # [B]
+                codes_batch,                          # [B, T_code_max]
+                code_lens_all,                        # [B]
+                emo_cond_b,                           # [B, T_emo_max, C]
+                cond_mel_lengths=cond_lengths,        # [B]
+                emo_cond_mel_lengths=emo_cond_lengths,# [B]
+                emo_vec=emovec,                       # [B, ...]
+                use_speed=use_speed_batch,            # [B]
+            )
+        
+        gpt_forward_time += time.perf_counter() - m_start_time
+        # ----------------------------------------------------------
+
         # optional global target length logic, same as your single infer
         per_seg_target_lengths = None
         if target_length_ms is not None and target_length_ms > 0:
@@ -651,72 +674,52 @@ class IndexTTS2:
         for b in range(B):
             i = seg2item[b]               # owner item index
             seg_idx = seg2local_idx[b]
-    
+        
             text_tokens = text_tokens_padded[b:b+1]
             codes = codes_batch[b:b+1]
-            speech_conditioning_latent = speech_conditioning_latent_batch[b:b+1]
-    
+        
             code_len = int(code_lens_all[b].item())
             codes = codes[:, :code_len]
             code_lens = torch.tensor([code_len], device=self.device, dtype=torch.long)
-    
+        
             if (codes[:, -1] != self.stop_mel_token).any() and not has_warned:
                 warnings.warn(
                     f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}).",
                     category=RuntimeWarning
                 )
                 has_warned = True
-    
-            m_start_time = time.perf_counter()
-            use_speed = torch.zeros(1, device=self.device, dtype=torch.long)
-            emo_cond_b_i = emo_cond_list[i]
-            spk_cond_i = spk_cond_list[i]
-            emovec_i = emovec[b:b+1]
-    
-            with torch.amp.autocast(text_tokens.device.type,
-                                     enabled=self.dtype is not None,
-                                     dtype=self.dtype):
-                latent = self.gpt(
-                    speech_conditioning_latent,
-                    text_tokens,
-                    torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
-                    codes,
-                    torch.tensor([codes.shape[-1]], device=text_tokens.device),
-                    emo_cond_b_i,
-                    cond_mel_lengths=torch.tensor([spk_cond_i.shape[1]], device=text_tokens.device),
-                    emo_cond_mel_lengths=torch.tensor([emo_cond_b_i.shape[1]], device=text_tokens.device),
-                    emo_vec=emovec_i,
-                    use_speed=use_speed,
-                )
-            gpt_forward_time += time.perf_counter() - m_start_time
-    
-            # --- s2mel + vocoder (same as your single infer, but picking per-item style/prompt) ---
+        
+            # -------- NEW: just pick the precomputed latent -----------
+            latent = latent_batch[b:b+1]   # [1, T_latent, C]
+            # -----------------------------------------------------------
+        
+            # --- s2mel + vocoder (unchanged, using prompt_condition_list[i], style_list[i], ref_mel_list[i]) ---
             with torch.amp.autocast(text_tokens.device.type, enabled=False, dtype=None):
                 m_start_time = time.perf_counter()
-    
+        
                 diffusion_steps = 25
                 inference_cfg_rate = 0.7
                 latent = self.s2mel.models['gpt_layer'](latent)
                 S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1)).transpose(1, 2)
                 S_infer = S_infer + latent
-    
+        
                 if per_seg_target_lengths is not None:
                     target_lengths = per_seg_target_lengths[b:b+1].to(S_infer.device)
                 else:
                     base_factor = 1.72
                     target_lengths = (code_lens * base_factor / max(speed, 1e-3)).long()
-    
+        
                 prompt_condition = prompt_condition_list[i]
                 style = style_list[i]
                 ref_mel = ref_mel_list[i]
-    
+        
                 cond = self.s2mel.models['length_regulator'](
                     S_infer,
                     ylens=target_lengths,
                     n_quantizers=3,
                     f0=None
                 )[0]
-    
+        
                 cat_condition = torch.cat([prompt_condition, cond], dim=1)
                 vc_target = self.s2mel.models['cfm'].inference(
                     cat_condition,
@@ -729,17 +732,18 @@ class IndexTTS2:
                 )
                 vc_target = vc_target[:, :, ref_mel.size(-1):]
                 s2mel_time += time.perf_counter() - m_start_time
-    
+        
                 vc_target = vc_target.clone().detach()
-    
+        
                 m_start_time = time.perf_counter()
                 with torch.no_grad():
                     wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
                 bigvgan_time += time.perf_counter() - m_start_time
                 wav = wav.squeeze(1)
-    
+        
             wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
             wavs_per_item[i].append(wav.cpu())
+
     
         # ------------------------------------------------------------------
         # 6) SAVE PER-ITEM WAVS
