@@ -652,20 +652,74 @@ class IndexTTS2:
         gpt_forward_time += time.perf_counter() - m_start_time
         # ----------------------------------------------------------
 
-        # optional global target length logic, same as your single infer
+        # --------------------------------------------------------------
+        # 5b) OPTIONAL PER-SEGMENT TARGET LENGTHS (ms)
+        #     - supports:
+        #       * scalar target_length_ms: global (old behaviour)
+        #       * sequence of length N: per-item durations
+        # --------------------------------------------------------------
         per_seg_target_lengths = None
-        if target_length_ms is not None and target_length_ms > 0:
+        if target_length_ms is not None:
             base_factor = 1.72
-            base_frames = code_lens_all.float() * base_factor
-            total_base_frames = base_frames.sum()
+            base_frames = code_lens_all.float() * base_factor  # [B]
             hop_length = self.cfg.s2mel['preprocess_params']['spect_params']['hop_length']
             sr = 22050
-            estimated_seconds_base = (total_base_frames * hop_length) / float(sr)
-            if estimated_seconds_base > 1e-3:
-                desired_seconds = target_length_ms / 1000.0
-                ratio = desired_seconds / estimated_seconds_base
-                per_seg_frames = (base_frames * ratio).clamp(min=1.0).long()
-                per_seg_target_lengths = per_seg_frames
+
+            # Case 1: single scalar -> keep your original global behaviour
+            if isinstance(target_length_ms, (int, float)):
+                if target_length_ms > 0:
+                    total_base_frames = base_frames.sum()
+                    estimated_seconds_base = (total_base_frames * hop_length) / float(sr)
+                    if estimated_seconds_base > 1e-3:
+                        desired_seconds = float(target_length_ms) / 1000.0
+                        ratio = desired_seconds / estimated_seconds_base
+                        per_seg_target_lengths = (base_frames * ratio).clamp(min=1.0).long()  # [B]
+
+            # Case 2: list / tuple / 1D tensor -> per-item durations
+            else:
+                # convert to tensor of length N
+                if isinstance(target_length_ms, torch.Tensor):
+                    tl = target_length_ms.to(self.device).float()
+                else:
+                    tl = torch.tensor(target_length_ms, device=self.device, dtype=torch.float32)
+
+                assert tl.ndim == 1, "target_length_ms must be scalar or 1D sequence"
+                assert tl.numel() == N, (
+                    f"target_length_ms length ({tl.numel()}) must match batch size N={N}"
+                )
+
+                per_seg_target_lengths = torch.zeros(
+                    B, device=self.device, dtype=torch.long
+                )
+
+                # compute per-item ratios and distribute within each item's segments
+                for i in range(N):
+                    desired_ms = tl[i].item()
+                    if desired_ms <= 0:
+                        continue  # leave zeros -> will fall back to speed-based logic
+
+                    # segments belonging to item i
+                    seg_indices = [b for b, item_idx in enumerate(seg2item) if item_idx == i]
+                    if len(seg_indices) == 0:
+                        continue
+
+                    seg_indices_tensor = torch.tensor(seg_indices, device=self.device, dtype=torch.long)
+                    base_frames_i = base_frames[seg_indices_tensor]  # [num_segs_i]
+
+                    total_base_frames_i = base_frames_i.sum()
+                    if total_base_frames_i <= 1e-3:
+                        continue
+
+                    estimated_seconds_i = (total_base_frames_i * hop_length) / float(sr)
+                    desired_seconds_i = desired_ms / 1000.0
+                    ratio_i = desired_seconds_i / estimated_seconds_i
+
+                    per_seg_frames_i = (base_frames_i * ratio_i).clamp(min=1.0).long()
+                    per_seg_target_lengths[seg_indices_tensor] = per_seg_frames_i
+
+                # NOTE: segments where per_seg_target_lengths[b] == 0
+                # will automatically fall back to speed-based logic below.
+
     
         # collect wavs per item
         wavs_per_item = [[] for _ in range(N)]
@@ -703,11 +757,17 @@ class IndexTTS2:
                 S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1)).transpose(1, 2)
                 S_infer = S_infer + latent
         
+                base_factor = 1.72
                 if per_seg_target_lengths is not None:
-                    target_lengths = per_seg_target_lengths[b:b+1].to(S_infer.device)
+                    seg_tlen = per_seg_target_lengths[b].item()
+                    if seg_tlen > 0:
+                        target_lengths = per_seg_target_lengths[b:b+1].to(S_infer.device)
+                    else:
+                        # fallback to original speed-based behavior
+                        target_lengths = (code_lens * base_factor / max(speed, 1e-3)).long()
                 else:
-                    base_factor = 1.72
                     target_lengths = (code_lens * base_factor / max(speed, 1e-3)).long()
+
         
                 prompt_condition = prompt_condition_list[i]
                 style = style_list[i]
