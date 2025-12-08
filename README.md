@@ -1,7 +1,7 @@
 # IndexTTS2 – Enhanced Fork (Batching + Duration Control + Speed)
 
 This repository is a [**modified fork of IndexTTS-2**](https://github.com/index-tts/index-tts).
-The goal of this fork is to keep full compatibility with the original project while adding several highly-requested features for production workflows.
+The goal of this fork is to keep full compatibility with the original project while adding batch inference and controlling the speed of speech.
 
 This fork includes major improvements implemented in **`infer_v2.py`** :
 
