@@ -30,6 +30,7 @@ from transformers.cache_utils import (
     DynamicCache,
     EncoderDecoderCache,
     OffloadedCache,
+    QuantizedCacheConfig,
     StaticCache,
 )
 from transformers.configuration_utils import PretrainedConfig
@@ -1735,9 +1736,6 @@ class GenerationMixin:
                     model_kwargs=model_kwargs,
                 )
             elif generation_config.cache_implementation == "quantized":
-
-                from transformers.cache_utils import QuantizedCacheConfig
-
                 if not self._supports_quantized_cache:
                     raise ValueError(
                         "This model does not support the quantized cache. If you want your model to support quantized "
